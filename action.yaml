@@ -56,10 +56,10 @@ runs:
   using: "composite"
   steps:
     - name: Checkout user repo
-      uses: actions/checkout@v4
+      uses: actions/checkout@v5.0.0
 
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v6
       with:
         python-version: "3.11"
 
