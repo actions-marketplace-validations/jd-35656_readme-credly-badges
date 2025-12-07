@@ -1,0 +1,355 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Release type"
+        required: true
+        type: choice
+        options:
+          - release:major
+          - release:minor
+          - release:patch
+        default: release:patch
+
+  pull_request:
+    types: [closed]
+
+# Prevent concurrent releases
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  default-python: "3.13"
+
+jobs:
+  # ============================================================================
+  # Job 1: Determine release parameters and calculate version
+  # - Fast, read-only checks
+  # - Outputs passed to subsequent jobs
+  # ============================================================================
+  prepare-release:
+    name: 🔖 Prepare Release
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.merged == true &&
+      (contains(github.event.pull_request.labels.*.name, 'release:major') ||
+       contains(github.event.pull_request.labels.*.name, 'release:minor') ||
+       contains(github.event.pull_request.labels.*.name, 'release:patch')))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      bump_type: ${{ steps.determine_bump.outputs.bump_type }}
+      current_version: ${{ steps.calculate_version.outputs.current_version }}
+      new_version: ${{ steps.calculate_version.outputs.new_version }}
+
+    steps:
+      - name: 🔄 Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: 🏷️ Fetch latest tag
+        id: fetch_tag
+        run: |
+          git fetch --tags
+          latest_tag=$(git describe --tags --abbrev=0 --match "v*" 2>/dev/null || echo "v0.0.0")
+          echo "current_version=$latest_tag" >> $GITHUB_OUTPUT
+          echo "📌 Current version: $latest_tag"
+
+      - name: 🧠 Determine bump type
+        id: determine_bump
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            bump="${{ github.event.inputs.release }}"
+            echo "📋 Bump type from workflow input: $bump"
+          else
+            labels='${{ toJSON(github.event.pull_request.labels.*.name) }}'
+            if echo "$labels" | grep -q "release:major"; then
+              bump="release:major"
+            elif echo "$labels" | grep -q "release:minor"; then
+              bump="release:minor"
+            elif echo "$labels" | grep -q "release:patch"; then
+              bump="release:patch"
+            else
+              echo "❌ No valid release label found in PR."
+              echo "   Add one of: release:major, release:minor, release:patch"
+              exit 1
+            fi
+            echo "🏷️  Bump type from PR label: $bump"
+          fi
+          echo "bump_type=$bump" >> $GITHUB_OUTPUT
+
+      - name: 🧮 Calculate new version
+        id: calculate_version
+        run: |
+          current="${{ steps.fetch_tag.outputs.current_version }}"
+          bump="${{ steps.determine_bump.outputs.bump_type }}"
+
+          # Remove 'v' prefix for calculation
+          version_num="${current#v}"
+          IFS='.' read -r major minor patch <<< "$version_num"
+
+          # Handle empty or malformed version parts
+          major=${major:-0}
+          minor=${minor:-0}
+          patch=${patch:-0}
+
+          # Calculate new version based on bump type
+          case "$bump" in
+            release:major)
+              major=$((major + 1))
+              minor=0
+              patch=0
+              ;;
+            release:minor)
+              minor=$((minor + 1))
+              patch=0
+              ;;
+            release:patch)
+              patch=$((patch + 1))
+              ;;
+            *)
+              echo "❌ Invalid bump type: $bump"
+              exit 1
+              ;;
+          esac
+
+          new_version="v$major.$minor.$patch"
+          echo "current_version=$current" >> $GITHUB_OUTPUT
+          echo "new_version=$new_version" >> $GITHUB_OUTPUT
+          echo "✅ Version bump: $current → $new_version ($bump)"
+
+      - name: 📊 Add job summary
+        run: |
+          echo "### 🔖 Release Preparation" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Current Version:** ${{ steps.calculate_version.outputs.current_version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **New Version:** ${{ steps.calculate_version.outputs.new_version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Bump Type:** ${{ steps.determine_bump.outputs.bump_type }}" >> $GITHUB_STEP_SUMMARY
+
+  # ============================================================================
+  # Job 2: Bump version files, generate changelog, commit and tag
+  # - Modifies repository
+  # - Idempotent operations where possible
+  # ============================================================================
+  bump-and-changelog:
+    name: 📝 Bump Version & Changelog
+    needs: prepare-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      commit_sha: ${{ steps.commit_changes.outputs.commit_sha }}
+      has_changes: ${{ steps.commit_changes.outputs.has_changes }}
+
+    steps:
+      - name: 🔄 Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # Ensure we're on the right branch
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.ref || github.ref }}
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.default-python }}
+          cache: pip
+
+      - name: 📦 Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install nox
+
+      - name: 🔢 Bump version in files
+        run: |
+          echo "Bumping version to ${{ needs.prepare-release.outputs.new_version }}"
+          nox --error-on-missing-interpreters --non-interactive --session bump2version -- ${{ needs.prepare-release.outputs.new_version }}
+
+      - name: 📝 Generate changelog
+        run: |
+          echo "Generating changelog for ${{ needs.prepare-release.outputs.new_version }}"
+          nox --error-on-missing-interpreters --non-interactive --session changelog -- ${{ needs.prepare-release.outputs.new_version }}
+
+      - name: ✂️ Extract release notes
+        run: |
+          python3 << 'EOF'
+          from pathlib import Path
+          import sys
+          import re
+
+          version = "${{ needs.prepare-release.outputs.new_version }}"
+          changelog_path = Path("docs/changelog.md")
+          output_path = Path("release_notes.md")
+
+          # Default content if something goes wrong
+          default_content = f"# Release {version}\n\nNo detailed release notes available.\n"
+
+          # Check if changelog exists
+          if not changelog_path.exists():
+              print(f"⚠️  Changelog not found at {changelog_path}")
+              output_path.write_text(default_content)
+              sys.exit(0)
+
+          try:
+              content = changelog_path.read_text(encoding='utf-8')
+              lines = content.splitlines(keepends=True)
+          except Exception as e:
+              print(f"❌ Error reading changelog: {e}")
+              output_path.write_text(default_content)
+              sys.exit(0)
+
+          in_section = False
+          notes = []
+
+          # Flexible patterns to match various changelog formats
+          # Matches: "## [v1.2.3]", "## v1.2.3", "## 1.2.3", etc.
+          version_clean = version.lstrip('v')
+          version_pattern = re.compile(
+              r'^##\s+\[?' + re.escape(version) + r'\]?|' +
+              r'^##\s+\[?' + re.escape(version_clean) + r'\]?',
+              re.IGNORECASE
+          )
+          # Match any version header to know when to stop
+          section_pattern = re.compile(r'^##\s+\[?v?\d+\.\d+\.\d+', re.IGNORECASE)
+
+          for line in lines:
+              stripped = line.strip()
+              if version_pattern.match(stripped):
+                  in_section = True
+                  notes.append(line)
+              elif section_pattern.match(stripped) and in_section:
+                  # Hit the next version section, stop
+                  break
+              elif in_section:
+                  notes.append(line)
+
+          if notes:
+              # Clean up and write notes
+              notes_text = "".join(notes).strip()
+              if notes_text:
+                  output_path.write_text(notes_text + "\n", encoding='utf-8')
+                  print(f"✅ Extracted {len(notes)} lines of release notes for {version}")
+              else:
+                  output_path.write_text(default_content)
+                  print(f"⚠️  Empty release notes section for {version}")
+          else:
+              print(f"⚠️  No release notes section found for {version}")
+              output_path.write_text(default_content)
+          EOF
+
+      - name: ✅ Commit and tag
+        id: commit_changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Stage all changes
+          git add -A
+
+          # Check if there are changes to commit
+          has_changes="false"
+          if git diff --staged --quiet; then
+            echo "⚠️  No changes to commit"
+          else
+            git commit -m "chore: release ${{ needs.prepare-release.outputs.new_version }}"
+            has_changes="true"
+            echo "✅ Changes committed"
+          fi
+
+          # Create tag (check if exists first for idempotency)
+          tag="${{ needs.prepare-release.outputs.new_version }}"
+          if git rev-parse "$tag" >/dev/null 2>&1; then
+            echo "⚠️  Tag already exists: $tag"
+            echo "   Deleting and recreating to update..."
+            git tag -d "$tag"
+          fi
+
+          git tag -a "$tag" -m "Release $tag"
+          echo "✅ Tag created: $tag"
+
+          # Push changes and tags
+          git push origin HEAD --follow-tags
+
+          # Output results
+          commit_sha=$(git rev-parse HEAD)
+          echo "commit_sha=$commit_sha" >> $GITHUB_OUTPUT
+          echo "has_changes=$has_changes" >> $GITHUB_OUTPUT
+          echo "✅ Pushed to remote with SHA: $commit_sha"
+
+      - name: 📤 Upload release notes artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: release-notes
+          path: release_notes.md
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: 📊 Add job summary
+        run: |
+          echo "### 📝 Version Bump & Changelog" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit SHA:** \`${{ steps.commit_changes.outputs.commit_sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Has Changes:** ${{ steps.commit_changes.outputs.has_changes }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tag:** ${{ needs.prepare-release.outputs.new_version }}" >> $GITHUB_STEP_SUMMARY
+
+  # ============================================================================
+  # Job 3: Create GitHub Release
+  # - Uses artifacts from previous job
+  # - Can be re-run independently if needed
+  # ============================================================================
+  create-release:
+    name: 🚀 Create GitHub Release
+    needs: [prepare-release, bump-and-changelog]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: 📥 Download release notes
+        uses: actions/download-artifact@v6
+        with:
+          name: release-notes
+
+      - name: 📄 Display release notes
+        run: |
+          echo "Release notes content:"
+          cat release_notes.md
+
+      - name: 🚀 Create GitHub Release
+        id: create_release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare-release.outputs.new_version }}
+          name: Release ${{ needs.prepare-release.outputs.new_version }}
+          body_path: release_notes.md
+          draft: false
+          prerelease: false
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 📊 Add job summary
+        run: |
+          echo "### 🚀 GitHub Release Created" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version:** ${{ needs.prepare-release.outputs.new_version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit:** \`${{ needs.bump-and-changelog.outputs.commit_sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Release URL:** ${{ steps.create_release.outputs.url }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "🎉 **Release completed successfully!**" >> $GITHUB_STEP_SUMMARY
+
+      - name: ✅ Release completed
+        run: |
+          echo "════════════════════════════════════════════════════════════"
+          echo "🎉 Release ${{ needs.prepare-release.outputs.new_version }} created successfully!"
+          echo "════════════════════════════════════════════════════════════"
+          echo "📝 Commit SHA:    ${{ needs.bump-and-changelog.outputs.commit_sha }}"
+          echo "🏷️  Tag:          ${{ needs.prepare-release.outputs.new_version }}"
+          echo "🔗 Release URL:   ${{ steps.create_release.outputs.url }}"
+          echo "════════════════════════════════════════════════════════════"
